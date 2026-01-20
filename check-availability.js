@@ -64,84 +64,104 @@ async function checkAvailability() {
       timeout: 30000
     });
 
-    // ログイン処理
-    if (LOGIN_ID && LOGIN_PASSWORD) {
-      console.log('ログイン処理を開始...');
-      
-      // ログインボタンをクリック
-      await page.click('a[href*="login"]');
-      await page.waitForTimeout(2000);
-      
-      // ID/パスワード入力
-      await page.type('input[name*="ID"], input[type="text"]', LOGIN_ID);
-      await page.type('input[name*="PASS"], input[type="password"]', LOGIN_PASSWORD);
-      
-      // ログイン実行
-      await page.click('input[type="submit"], button[type="submit"]');
-      await page.waitForTimeout(3000);
-      
-      console.log('ログイン完了');
-    }
-
-    // 「施設種類から探す」をクリック
     console.log('庭球場を検索中...');
-    const facilityTypeLink = await page.$('a[href*="javascript:void(0)"]');
-    if (facilityTypeLink) {
-      const linkText = await page.evaluate(el => el.textContent, facilityTypeLink);
-      if (linkText.includes('施設種類から探す')) {
-        await facilityTypeLink.click();
-        await page.waitForTimeout(2000);
-      }
+    await page.waitForTimeout(2000);
+    
+    // 「施設種類から探す」のリンクを探してクリック
+    try {
+      await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a'));
+        const facilityTypeLink = links.find(a => a.textContent.includes('施設種類から探す'));
+        if (facilityTypeLink) {
+          facilityTypeLink.click();
+        }
+      });
+      await page.waitForTimeout(2000);
+      console.log('施設種類から探すをクリック');
+    } catch (e) {
+      console.log('施設種類から探すが見つかりませんでした');
     }
 
     // 「庭球場」を選択
-    const tennisCourtLink = await page.evaluateHandle(() => {
-      const links = Array.from(document.querySelectorAll('a'));
-      return links.find(a => a.textContent.includes('庭球場'));
-    });
-    
-    if (tennisCourtLink) {
-      await tennisCourtLink.click();
+    try {
+      await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a'));
+        const tennisLink = links.find(a => a.textContent.includes('庭球場'));
+        if (tennisLink) {
+          tennisLink.click();
+        }
+      });
       await page.waitForTimeout(3000);
+      console.log('庭球場をクリック');
+    } catch (e) {
+      console.log('庭球場リンクが見つかりませんでした');
     }
 
     // 空き状況を取得
     console.log('空き状況を取得中...');
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
     
     const availabilities = await page.evaluate((targets) => {
       const results = [];
       
-      // テーブルやリストから施設情報を探す
-      const rows = document.querySelectorAll('tr, li, div[class*="facility"], div[class*="schedule"]');
+      // すべてのテキストコンテンツを取得
+      const allText = document.body.innerText;
       
-      rows.forEach(row => {
-        const text = row.textContent || '';
-        
-        // 対象施設名が含まれているかチェック
-        const matchedFacility = targets.find(facility => text.includes(facility));
-        
-        if (matchedFacility) {
-          // 「○」「空き」「可」などの空き情報を探す
-          if (text.includes('○') || text.includes('空き') || text.includes('可') || 
-              text.match(/\d+:\d+/) || text.includes('利用可')) {
+      // 対象施設が含まれているかチェック
+      targets.forEach(facility => {
+        if (allText.includes(facility)) {
+          console.log(`${facility}の情報を発見`);
+          
+          // テーブル、リスト、divなどから情報を探す
+          const elements = document.querySelectorAll('table, tr, td, li, div, span, p');
+          
+          elements.forEach(el => {
+            const text = el.textContent || '';
             
-            // 日付情報を抽出
-            const dateMatch = text.match(/(\d+)月(\d+)日|(\d+)\/(\d+)/);
-            const timeMatch = text.match(/(\d+):(\d+)/g);
-            
-            results.push({
-              facility: matchedFacility,
-              text: text.trim().substring(0, 200),
-              hasAvailability: true,
-              date: dateMatch ? dateMatch[0] : '不明',
-              times: timeMatch || []
-            });
-          }
+            // 施設名が含まれ、かつ日付や空き情報がありそうな要素
+            if (text.includes(facility) && text.length > 10 && text.length < 500) {
+              // 空き状況を示すキーワードをチェック
+              const hasAvailability = 
+                text.includes('○') || 
+                text.includes('空き') || 
+                text.includes('可') ||
+                text.includes('△') ||
+                /\d+:\d+/.test(text) || // 時間表記
+                /\d+月\d+日/.test(text) || // 日付表記
+                text.includes('利用可');
+              
+              if (hasAvailability) {
+                // 日付を抽出
+                const dateMatch = text.match(/(\d+)月(\d+)日|(\d+)\/(\d+)/);
+                // 時間を抽出
+                const timeMatch = text.match(/(\d+):(\d+)/g);
+                
+                results.push({
+                  facility: facility,
+                  text: text.trim().substring(0, 300),
+                  hasAvailability: true,
+                  date: dateMatch ? dateMatch[0] : '日付不明',
+                  times: timeMatch || []
+                });
+              }
+            }
+          });
         }
       });
       
-      return results;
+      // 重複を削除
+      const uniqueResults = [];
+      const seen = new Set();
+      
+      results.forEach(item => {
+        const key = `${item.facility}-${item.date}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueResults.push(item);
+        }
+      });
+      
+      return uniqueResults;
     }, TARGET_FACILITIES);
 
     console.log(`取得した情報: ${availabilities.length}件`);
