@@ -1,0 +1,39 @@
+name: 庭球場空き状況チェック
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-availability:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: コードをチェックアウト
+        uses: actions/checkout@v4
+      
+      - name: Node.jsをセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: 依存パッケージをインストール
+        run: npm install
+      
+      - name: 空き状況をチェック
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          MEGURO_LOGIN_ID: ${{ secrets.MEGURO_LOGIN_ID }}
+          MEGURO_LOGIN_PASSWORD: ${{ secrets.MEGURO_LOGIN_PASSWORD }}
+        run: npm start
+      
+      - name: スクリーンショットをアップロード
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ github.run_number }}
+          path: /tmp/meguro-tennis-debug.png
+          if-no-files-found: ignore
+          retention-days: 7
