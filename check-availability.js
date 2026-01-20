@@ -13,7 +13,7 @@ const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 // 監視対象の施設名（部分一致で検索）
 const TARGET_FACILITIES = [
   '駒場',
-  '目黒区民センター',
+  '区民センター',
   '碑文谷'
 ];
 
@@ -58,110 +58,111 @@ async function checkAvailability() {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
     
-    console.log('目黒区施設予約システムにアクセス中...');
-    await page.goto('https://resv.city.meguro.tokyo.jp/Web/Home/WgR_ModeSelect', {
+    console.log('庭球場詳細ページにアクセス中...');
+    await page.goto('https://resv.city.meguro.tokyo.jp/Web/Yoyaku/WgR_JikantaibetsuAkiJoukyou', {
       waitUntil: 'networkidle2',
       timeout: 30000
     });
-
-    console.log('庭球場を検索中...');
-    await page.waitForTimeout(2000);
     
-    // 「施設種類から探す」のリンクを探してクリック
-    try {
-      await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a'));
-        const facilityTypeLink = links.find(a => a.textContent.includes('施設種類から探す'));
-        if (facilityTypeLink) {
-          facilityTypeLink.click();
-        }
-      });
-      await page.waitForTimeout(2000);
-      console.log('施設種類から探すをクリック');
-    } catch (e) {
-      console.log('施設種類から探すが見つかりませんでした');
-    }
-
-    // 「庭球場」を選択
-    try {
-      await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a'));
-        const tennisLink = links.find(a => a.textContent.includes('庭球場'));
-        if (tennisLink) {
-          tennisLink.click();
-        }
-      });
-      await page.waitForTimeout(3000);
-      console.log('庭球場をクリック');
-    } catch (e) {
-      console.log('庭球場リンクが見つかりませんでした');
-    }
-
-    // 空き状況を取得
-    console.log('空き状況を取得中...');
+    console.log('ページ読み込み完了、詳細な空き状況を確認中...');
     await page.waitForTimeout(3000);
+
+    // 詳細な空き状況を取得
+    console.log('詳細な空き状況を取得中...');
     
     const availabilities = await page.evaluate((targets) => {
       const results = [];
       
-      // すべてのテキストコンテンツを取得
-      const allText = document.body.innerText;
+      // すべてのテーブルを取得
+      const tables = document.querySelectorAll('table');
       
-      // 対象施設が含まれているかチェック
-      targets.forEach(facility => {
-        if (allText.includes(facility)) {
-          console.log(`${facility}の情報を発見`);
+      console.log(`${tables.length}個のテーブルを発見`);
+      
+      tables.forEach((table, tableIndex) => {
+        const tableText = table.textContent || '';
+        
+        // 対象施設が含まれているかチェック
+        const matchedFacility = targets.find(facility => tableText.includes(facility));
+        
+        if (!matchedFacility) {
+          return; // この施設は対象外
+        }
+        
+        console.log(`${matchedFacility}のテーブルを発見`);
+        
+        // テーブルの見出しから施設名と日付を取得
+        let currentDate = '';
+        let currentFacility = matchedFacility;
+        
+        // 日付を探す（例：2026年1月21日(水)）
+        const dateMatch = tableText.match(/(\d+)年(\d+)月(\d+)日\((.)\)/);
+        if (dateMatch) {
+          currentDate = `${dateMatch[2]}月${dateMatch[3]}日(${dateMatch[4]})`;
+        }
+        
+        // テーブルのヘッダー行から時間帯を取得
+        const headerRow = table.querySelector('tr');
+        if (!headerRow) return;
+        
+        const timeSlots = [];
+        const headerCells = headerRow.querySelectorAll('th, td');
+        
+        headerCells.forEach(cell => {
+          const cellText = cell.textContent.trim();
+          // 時間帯のパターン（例：9:00～11:00）
+          if (/\d+:\d+/.test(cellText)) {
+            timeSlots.push(cellText);
+          }
+        });
+        
+        console.log(`時間帯: ${timeSlots.join(', ')}`);
+        
+        // データ行を処理
+        const rows = table.querySelectorAll('tr');
+        
+        rows.forEach((row, rowIndex) => {
+          if (rowIndex === 0) return; // ヘッダー行はスキップ
           
-          // テーブル、リスト、divなどから情報を探す
-          const elements = document.querySelectorAll('table, tr, td, li, div, span, p');
+          const cells = row.querySelectorAll('td');
+          if (cells.length === 0) return;
           
-          elements.forEach(el => {
-            const text = el.textContent || '';
+          // 最初のセルはコート名など
+          const courtName = cells[0] ? cells[0].textContent.trim() : '';
+          
+          // 各時間帯のセルをチェック
+          cells.forEach((cell, cellIndex) => {
+            const cellText = cell.textContent.trim();
             
-            // 施設名が含まれ、かつ日付や空き情報がありそうな要素
-            if (text.includes(facility) && text.length > 10 && text.length < 500) {
-              // 空き状況を示すキーワードをチェック
-              const hasAvailability = 
-                text.includes('○') || 
-                text.includes('空き') || 
-                text.includes('可') ||
-                text.includes('△') ||
-                /\d+:\d+/.test(text) || // 時間表記
-                /\d+月\d+日/.test(text) || // 日付表記
-                text.includes('利用可');
+            // ○が含まれていれば空きあり
+            if (cellText === '○' || cellText.includes('○')) {
+              // 対応する時間帯を取得
+              // ヘッダーとデータ行のセル位置を合わせる
+              let timeSlot = '';
               
-              if (hasAvailability) {
-                // 日付を抽出
-                const dateMatch = text.match(/(\d+)月(\d+)日|(\d+)\/(\d+)/);
-                // 時間を抽出
-                const timeMatch = text.match(/(\d+):(\d+)/g);
-                
+              // ヘッダー行の同じ位置から時間帯を取得
+              const headerCellAtSamePosition = headerRow.querySelectorAll('th, td')[cellIndex];
+              if (headerCellAtSamePosition) {
+                timeSlot = headerCellAtSamePosition.textContent.trim();
+              }
+              
+              if (timeSlot && /\d+:\d+/.test(timeSlot)) {
                 results.push({
-                  facility: facility,
-                  text: text.trim().substring(0, 300),
-                  hasAvailability: true,
-                  date: dateMatch ? dateMatch[0] : '日付不明',
-                  times: timeMatch || []
+                  facility: currentFacility,
+                  date: currentDate || '日付不明',
+                  court: courtName || 'コート不明',
+                  time: timeSlot,
+                  text: `${currentFacility} - ${currentDate} ${courtName} ${timeSlot}`
                 });
+                
+                console.log(`空き発見: ${currentFacility} ${currentDate} ${courtName} ${timeSlot}`);
               }
             }
           });
-        }
+        });
       });
       
-      // 重複を削除
-      const uniqueResults = [];
-      const seen = new Set();
-      
-      results.forEach(item => {
-        const key = `${item.facility}-${item.date}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          uniqueResults.push(item);
-        }
-      });
-      
-      return uniqueResults;
+      console.log(`合計${results.length}件の空き時間を発見`);
+      return results;
     }, TARGET_FACILITIES);
 
     console.log(`取得した情報: ${availabilities.length}件`);
@@ -172,30 +173,52 @@ async function checkAvailability() {
 
     // 空きがあれば通知
     if (availabilities.length > 0) {
-      let message = '🎾 目黒区庭球場に空きが見つかりました！\n\n';
-      
-      availabilities.forEach((item, index) => {
-        message += `【${item.facility}】\n`;
-        message += `日付: ${item.date}\n`;
-        if (item.times.length > 0) {
-          message += `時間: ${item.times.join(', ')}\n`;
+      // 施設ごと、日付ごとにグループ化
+      const grouped = {};
+      availabilities.forEach(item => {
+        const key = `${item.facility}`;
+        if (!grouped[key]) {
+          grouped[key] = {};
         }
-        message += `---\n`;
+        
+        const dateKey = item.date;
+        if (!grouped[key][dateKey]) {
+          grouped[key][dateKey] = [];
+        }
+        
+        grouped[key][dateKey].push(item);
       });
       
-      message += '\n今すぐ予約: https://resv.city.meguro.tokyo.jp/Web/Home/WgR_ModeSelect';
+      let message = '🎾 目黒区庭球場に空きが見つかりました！\n\n';
+      
+      Object.keys(grouped).forEach(facility => {
+        message += `【${facility}】\n`;
+        
+        Object.keys(grouped[facility]).forEach(date => {
+          message += `${date}\n`;
+          
+          grouped[facility][date].forEach(item => {
+            message += `  ${item.court} ${item.time}\n`;
+          });
+        });
+        
+        message += '\n';
+      });
+      
+      message += '予約はこちら:\nhttps://resv.city.meguro.tokyo.jp/Web/Yoyaku/WgR_JikantaibetsuAkiJoukyou';
       
       await sendEmailNotify('🎾 庭球場に空きあり！', message);
       console.log('空きを検出し、メール通知を送信しました');
+      console.log('通知内容:\n' + message);
     } else {
       console.log('現在、対象施設に空きはありません');
       
       // 24時間に1回、動作確認の通知を送る（オプション）
       const hour = new Date().getHours();
-      if (hour === 9) { // 毎日9時に動作確認
+      if (hour === 0) { // 毎日0時に動作確認（UTC時間なので日本時間9時）
         await sendEmailNotify(
           '目黒区庭球場チェッカー 動作確認',
-          '目黒区庭球場チェッカーは正常に動作しています（現在空きなし）'
+          '目黒区庭球場チェッカーは正常に動作しています（現在空きなし）\n\n監視中の施設：\n- 駒場庭球場\n- 区民センター体育館\n- 碑文谷庭球場'
         );
       }
     }
