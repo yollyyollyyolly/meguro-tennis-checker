@@ -93,7 +93,6 @@ async function gotoWithRetry(page, url, label, opts = {}) {
 async function clickByHeuristics(page, label) {
   log(`${label}: clickByHeuristics start`);
 
-  // クリック候補：hrefに目的URLが入ってる / onclickに目的パスが入ってる / 文言がそれっぽい
   const result = await page.evaluate((CAL_URL) => {
     function norm(s) {
       return (s || "").replace(/\s+/g, " ").trim();
@@ -110,14 +109,12 @@ async function clickByHeuristics(page, label) {
       if (onclick.includes("WgR_ShisetsubetsuAkiJoukyou")) score += 100;
       if (href === CAL_URL) score += 120;
 
-      // 文言ヒューリスティック
       const blob = `${text} ${value}`.toLowerCase();
       if (blob.includes("施設種類")) score += 30;
       if (blob.includes("庭球場")) score += 25;
       if (blob.includes("空き") || blob.includes("空状況") || blob.includes("空き状況")) score += 15;
       if (blob.includes("検索")) score += 10;
 
-      // クリックできそうな要素に加点
       if (tag === "a" || tag === "button") score += 10;
       if (tag === "input") {
         const type = (el.getAttribute("type") || "").toLowerCase();
@@ -137,7 +134,6 @@ async function clickByHeuristics(page, label) {
     if (candidates.length === 0) return { ok: false, why: "no candidates" };
 
     const best = candidates[0];
-    // クリック実行
     best.el.scrollIntoView({ block: "center" });
     best.el.click();
 
@@ -156,13 +152,11 @@ async function clickByHeuristics(page, label) {
 async function clickFacilityFlow(page) {
   log("FLOW: click facility->tennis (fallback)");
 
-  // 施設種類らしきボタン
   const clicked1 = await page.evaluate(() => {
     function norm(s) {
       return (s || "").replace(/\s+/g, " ").trim();
     }
     const els = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
-    // 施設種類 / 種類から探す / 施設検索
     const hit = els.find((el) => {
       const t = norm(el.innerText || el.textContent || el.getAttribute("value") || "");
       return t.includes("施設種類") || t.includes("種類から探す") || t.includes("施設検索");
@@ -176,13 +170,11 @@ async function clickFacilityFlow(page) {
 
   await sleep(1500);
 
-  // 庭球場をクリック
   const clicked2 = await page.evaluate(() => {
     function norm(s) {
       return (s || "").replace(/\s+/g, " ").trim();
     }
     const els = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit], div, span"));
-    // 「庭球場」を含むクリック可能要素を探す
     const hit = els.find((el) => {
       const t = norm(el.innerText || el.textContent || "");
       return t.includes("庭球場");
@@ -198,30 +190,25 @@ async function clickFacilityFlow(page) {
 }
 
 async function ensureCalendar(page) {
-  // まずSTARTへ
   await gotoWithRetry(page, START_URL, "TOP");
 
   const topHtml = await page.content();
   await safeWrite(OUT.startHtml, topHtml);
   await safeShot(page, OUT.startPng);
 
-  // パターンA：TOPから「カレンダーへ行く要素」をクリック
-  // navigationが走る可能性があるので waitForNavigation と併用（タイミングズレ対策）
   for (let i = 0; i < 3; i++) {
     log(`CAL: try click heuristics round=${i + 1}`);
 
     const navPromise = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-    const ok = await clickByHeuristics(page, "CAL");
+    await clickByHeuristics(page, "CAL");
     const nav = await navPromise;
 
-    // クリックで動かない場合もあるので、少し待ってURL判定
     await sleep(2000);
 
     const u = page.url();
     log(`CAL: after click url=${u} nav=${nav ? "yes" : "no"}`);
     if (u.includes("WgR_ShisetsubetsuAkiJoukyou") && !isGoBackErrorUrl(u)) return true;
 
-    // GoBackErrorならTOPに戻して別ルートを試す
     if (isGoBackErrorUrl(u)) {
       log("CAL: hit GoBackError after click, going back to TOP and retry");
       await gotoWithRetry(page, START_URL, "TOP_RETRY");
@@ -229,7 +216,6 @@ async function ensureCalendar(page) {
     }
   }
 
-  // パターンB：施設種類→庭球場（強制フロー）
   log("CAL: fallback facility flow");
   await gotoWithRetry(page, START_URL, "TOP_FALLBACK");
   const navPromise2 = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => null);
@@ -241,7 +227,6 @@ async function ensureCalendar(page) {
   log(`CAL: after facility flow url=${u2}`);
   if (u2.includes("WgR_ShisetsubetsuAkiJoukyou") && !isGoBackErrorUrl(u2)) return true;
 
-  // パターンC：最後に「referer付きでCALを直叩き」（一応残す）
   log("CAL: last resort goto CAL with referer");
   await gotoWithRetry(page, CAL_URL, "CAL_GOTO_LAST", { referer: START_URL });
   await sleep(1200);
@@ -266,22 +251,15 @@ async function ensureCalendar(page) {
 
     browser = await puppeteer.launch({
       headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 720 });
     await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
     );
 
-    // 文字化けスクショは気にしない。安定性優先で重いリソースは落とす
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const t = req.resourceType();
@@ -292,7 +270,6 @@ async function ensureCalendar(page) {
       log(`requestfailed: ${req.resourceType()} ${req.failure()?.errorText} ${req.url()}`);
     });
 
-    // カレンダー到達を保証する
     const reached = await ensureCalendar(page);
 
     const calHtml = await page.content();
@@ -305,13 +282,9 @@ async function ensureCalendar(page) {
     if (!reached || isGoBackErrorUrl(finalUrl) || !finalUrl.includes("WgR_ShisetsubetsuAkiJoukyou")) {
       await safeShot(page, OUT.errPng);
       await safeWrite(OUT.errHtml, calHtml);
-      throw new Error(
-        `CAL not reached (or GoBackError). final=${finalUrl}\n` +
-          `次はArtifactsのHTML/PNGで、どのボタンが押されているか確定してピン留めします。`
-      );
+      throw new Error(`CAL not reached (or GoBackError). final=${finalUrl}`);
     }
 
-    // ここまで来たら「正しく遷移できた」ので、まずそれを成功通知する（空き抽出は次段）
     await sendMail(
       "✅ 目黒区チェッカー：カレンダー到達（正規遷移OK）",
       [
@@ -325,8 +298,6 @@ async function ensureCalendar(page) {
         `- ${OUT.startHtml}`,
         `- ${OUT.calHtml}`,
         `- ${OUT.logTxt}`,
-        "",
-        "次のステップ：このカレンダー画面から「○/△をクリックして時間帯ページへ」も自動化できます。",
       ].join("\n")
     );
 
@@ -337,18 +308,13 @@ async function ensureCalendar(page) {
     try {
       await sendMail(
         "❌ 目黒区チェッカー：エラー",
-        [
-          "実行中にエラーが発生しました。",
-          "",
-          String(e?.stack || e?.message || e),
-          "",
-          "Artifacts(debug)にHTML/PNG/logが残ります。",
-          "GoBackErrorの場合は「直叩き不可＝正規遷移必須」なので、このコードはクリック遷移を全ルート試します。",
-        ].join("\n")
+        ["実行中にエラーが発生しました。", "", String(e?.stack || e?.message || e)].join("\n")
       );
     } catch (_) {}
     if (browser) {
-      try { await browser.close(); } catch (_) {}
+      try {
+        await browser.close();
+      } catch (_) {}
     }
     process.exit(1);
   }
