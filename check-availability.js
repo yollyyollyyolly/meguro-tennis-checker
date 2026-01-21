@@ -6,8 +6,7 @@ const { Resend } = require("resend");
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
 
-// Optional proxy (if GitHub IP is blocked, proxy is the final boss)
-// PROXY_SERVER example: http://host:port  or  socks5://host:port
+// Optional proxy (if GitHub IP is blocked)
 const PROXY_SERVER = process.env.PROXY_SERVER;
 const PROXY_USERNAME = process.env.PROXY_USERNAME;
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
@@ -32,11 +31,9 @@ const OUT = {
 function must(name, v) {
   if (!v) throw new Error(`Missing env: ${name}`);
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function appendLog(line) {
   const s = `[${new Date().toISOString()}] ${line}\n`;
   process.stdout.write(s);
@@ -44,13 +41,11 @@ function appendLog(line) {
     fs.appendFileSync(OUT.logTxt, s, "utf-8");
   } catch (_) {}
 }
-
 async function safeWrite(path, content) {
   try {
     fs.writeFileSync(path, content, "utf-8");
   } catch (_) {}
 }
-
 async function safeShot(page, path) {
   try {
     await page.screenshot({ path, fullPage: true });
@@ -60,8 +55,8 @@ async function safeShot(page, path) {
 async function sendMail(subject, text) {
   must("RESEND_API_KEY", RESEND_API_KEY);
   must("NOTIFY_EMAIL", NOTIFY_EMAIL);
-  const resend = new Resend(RESEND_API_KEY);
 
+  const resend = new Resend(RESEND_API_KEY);
   const { data, error } = await resend.emails.send({
     from: "Meguro Tennis Checker <onboarding@resend.dev>",
     to: [NOTIFY_EMAIL],
@@ -74,7 +69,6 @@ async function sendMail(subject, text) {
 }
 
 function classifyBlock(status, bodyText) {
-  // 強めのブロック・拒否兆候
   const t = bodyText || "";
   const is403 = status === 403;
   const is429 = status === 429;
@@ -88,6 +82,7 @@ function classifyBlock(status, bodyText) {
     "無効",
     "禁止",
     "このページは表示できません",
+    "ホームへ",
   ];
   const kwHit = keywords.some((k) => t.includes(k));
 
@@ -99,7 +94,7 @@ function classifyBlock(status, bodyText) {
   };
 }
 
-// ====== MAIN LOGIC ======
+// ====== MAIN ======
 (async () => {
   try {
     must("RESEND_API_KEY", RESEND_API_KEY);
@@ -111,10 +106,7 @@ function classifyBlock(status, bodyText) {
     appendLog(`NOTIFY_EMAIL: ${NOTIFY_EMAIL}`);
     appendLog(`PROXY: ${PROXY_SERVER ? "ON" : "OFF"}`);
 
-    const launchOptions = {
-      headless: true,
-    };
-
+    const launchOptions = { headless: true };
     if (PROXY_SERVER) {
       launchOptions.proxy = {
         server: PROXY_SERVER,
@@ -125,7 +117,12 @@ function classifyBlock(status, bodyText) {
 
     const browser = await chromium.launch(launchOptions);
 
-    // “人間ブラウザっぽさ”最大化セット
+    // 「文字化けしてもOK」方針：画像/フォントは落としてHTML中心で判定する
+    const baseHeaders = {
+      "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+      "Upgrade-Insecure-Requests": "1",
+    };
+
     const context = await browser.newContext({
       locale: "ja-JP",
       timezoneId: "Asia/Tokyo",
@@ -133,33 +130,23 @@ function classifyBlock(status, bodyText) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 720 },
-      extraHTTPHeaders: {
-        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
-        "Upgrade-Insecure-Requests": "1",
-      },
+      extraHTTPHeaders: baseHeaders,
     });
 
-    // 重要：リソース最適化（ただしHTML解析はするので、CSS/画像を落としてもOK）
-    // ただし、サイトによってはCSSがないと要素構造が変わることがあるので、
-    // 画像/フォント/メディアだけ落とし、script/xhr/documentは残す
+    // 軽量化：image/font/mediaは落とす（timeout低減）
     await context.route("**/*", (route) => {
-      const req = route.request();
-      const type = req.resourceType();
+      const type = route.request().resourceType();
       if (type === "image" || type === "font" || type === "media") return route.abort();
       return route.continue();
     });
 
     const page = await context.newPage();
 
-    // デバッグ：失敗時に原因が分かるように通信失敗をログ化
     page.on("requestfailed", (req) => {
       appendLog(`requestfailed: ${req.resourceType()} ${req.failure()?.errorText} ${req.url()}`);
     });
 
-    // “一発で行く”ためのナビ戦略：
-    // - timeoutを長く
-    // - waitUntil を段階で試す
-    // - 失敗時は指数バックオフで2回リトライ
+    // ここが重要：Refererはヘッダーをいじらず page.goto の option referer を使う
     async function robustGoto(url, label, referer) {
       const attempts = [
         { waitUntil: "domcontentloaded", timeout: 180000 },
@@ -171,28 +158,16 @@ function classifyBlock(status, bodyText) {
         appendLog(`${label}: goto attempt=${i + 1} backoff=${backoff}ms url=${url}`);
         await sleep(backoff);
 
-        try {
-          if (referer) {
-            await page.setExtraHTTPHeaders({
-              ...context._options.extraHTTPHeaders,
-              Referer: referer,
-            });
+        for (const a of attempts) {
+          try {
+            const resp = await page.goto(url, { ...a, referer: referer || undefined });
+            const status = resp ? resp.status() : 0;
+            appendLog(`${label}: goto ok waitUntil=${a.waitUntil} status=${status} final=${page.url()}`);
+            await sleep(2500);
+            return resp;
+          } catch (e) {
+            appendLog(`${label}: goto fail waitUntil=${a.waitUntil} msg=${e?.message || e}`);
           }
-
-          // 段階で試す（片方が刺さることがある）
-          for (const a of attempts) {
-            try {
-              const resp = await page.goto(url, a);
-              const status = resp ? resp.status() : 0;
-              appendLog(`${label}: goto ok waitUntil=${a.waitUntil} status=${status} final=${page.url()}`);
-              await sleep(2500);
-              return resp;
-            } catch (e) {
-              appendLog(`${label}: goto fail waitUntil=${a.waitUntil} msg=${e?.message || e}`);
-            }
-          }
-        } catch (e) {
-          appendLog(`${label}: outer fail msg=${e?.message || e}`);
         }
       }
       throw new Error(`${label}: goto failed after retries url=${url} current=${page.url()}`);
@@ -202,11 +177,11 @@ function classifyBlock(status, bodyText) {
     appendLog("1) TOP access");
     const topResp = await robustGoto(START_URL, "TOP");
     const topStatus = topResp ? topResp.status() : 0;
+
     const topHtml = await page.content();
     await safeWrite(OUT.startHtml, topHtml);
     await safeShot(page, OUT.startPng);
 
-    // ブロック/過負荷判定
     const topText = await page.evaluate(() => document.body?.innerText || "");
     const topJudge = classifyBlock(topStatus, topText);
     appendLog(`TOP judge: ${JSON.stringify(topJudge)}`);
@@ -219,10 +194,11 @@ function classifyBlock(status, bodyText) {
       );
     }
 
-    // 2) CAL（Referer付きで開く）
+    // 2) CAL（Referer付き）
     appendLog("2) CAL access");
     const calResp = await robustGoto(CAL_URL, "CAL", START_URL);
     const calStatus = calResp ? calResp.status() : 0;
+
     const calHtml = await page.content();
     await safeWrite(OUT.calHtml, calHtml);
     await safeShot(page, OUT.calPng);
@@ -231,10 +207,10 @@ function classifyBlock(status, bodyText) {
     const calJudge = classifyBlock(calStatus, calText);
     appendLog(`CAL judge: ${JSON.stringify(calJudge)}`);
 
-    // 到達確認（URLが戻される/別ページになる事がある）
     const finalUrl = page.url();
     appendLog(`CAL finalUrl: ${finalUrl}`);
 
+    // 未到達なら落とす（「空きなし」誤判定を防ぐ）
     if (!finalUrl.includes("WgR_ShisetsubetsuAkiJoukyou")) {
       await safeShot(page, OUT.errPng);
       await safeWrite(OUT.errHtml, calHtml);
@@ -252,23 +228,21 @@ function classifyBlock(status, bodyText) {
       );
     }
 
-    // ここまで来れば “遷移は成功”
+    // ここまでOK
     await sendMail(
-      "✅ 目黒区チェッカー：カレンダー到達OK（全部入り版）",
+      "✅ 目黒区チェッカー：カレンダー到達OK（ヘッダー修正版）",
       [
         "カレンダーページへ到達できました。",
         "",
         `URL: ${finalUrl}`,
         `HTTP status: ${calStatus}`,
         "",
-        "デバッグ成果物（Artifacts）:",
+        "Artifacts(debug-xxxx)で以下が見れます：",
         `- ${OUT.startPng}`,
         `- ${OUT.calPng}`,
         `- ${OUT.startHtml}`,
         `- ${OUT.calHtml}`,
         `- ${OUT.logTxt}`,
-        "",
-        "次はこのHTMLから○/△を抽出し、時間帯ページ（WgR_JikantaibetsuAkiJoukyou）まで自動追跡して通知します。",
       ].join("\n")
     );
 
@@ -278,19 +252,14 @@ function classifyBlock(status, bodyText) {
     appendLog(`FATAL: ${err?.stack || err?.message || err}`);
     try {
       await sendMail(
-        "❌ 目黒区チェッカー：エラー（全部入り版）",
+        "❌ 目黒区チェッカー：エラー（ヘッダー修正版）",
         [
           "実行中にエラーが発生しました。",
           "",
           String(err?.stack || err?.message || err),
           "",
-          "Artifacts を確認してください（debug-xxxx）。",
-          "特に以下が重要です：",
-          "- /tmp/meguro-*.html（ブロック/遷移先判定）",
-          "- /tmp/meguro-*.png（画面状態）",
-          "- /tmp/meguro-log-*.txt（時系列ログ）",
-          "",
-          "もし blocked/denied が濃厚なら、最短の解決策は PROXY_SERVER の導入です。",
+          "Artifacts(debug-xxxx)を確認してください。",
+          "blocked/deniedが濃厚なら、次の一手は PROXY_SERVER の投入が最短です（Secrets追加だけ）。",
         ].join("\n")
       );
     } catch (_) {}
