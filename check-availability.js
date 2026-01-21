@@ -64,11 +64,12 @@ async function ensureNotErrorPage(page, label) {
 
     const browser = await puppeteer.launch({
       headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--lang=ja-JP",
-      ],
+     args: [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--lang=ja-JP",
+  "--disable-dev-shm-usage"
+],
     });
 
     const page = await browser.newPage();
