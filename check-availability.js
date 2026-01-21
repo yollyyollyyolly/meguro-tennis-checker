@@ -22,6 +22,7 @@ function mustEnv(name, v) {
 async function sendMail(subject, text) {
   mustEnv("RESEND_API_KEY", RESEND_API_KEY);
   mustEnv("NOTIFY_EMAIL", NOTIFY_EMAIL);
+
   const resend = new Resend(RESEND_API_KEY);
   const { data, error } = await resend.emails.send({
     from: "Meguro Tennis Checker <onboarding@resend.dev>",
@@ -29,6 +30,7 @@ async function sendMail(subject, text) {
     subject,
     text,
   });
+
   if (error) throw new Error(`Resend error: ${JSON.stringify(error)}`);
   console.log("メール送信成功", data ? { id: data.id } : "");
 }
@@ -39,9 +41,17 @@ async function safeShot(page, path) {
   } catch (_) {}
 }
 
+async function dumpHtml(page) {
+  try {
+    fs.writeFileSync(HTML_ERROR, await page.content(), "utf-8");
+  } catch (_) {}
+}
+
 async function ensureNotErrorPage(page, label) {
   const bodyText = await page.evaluate(() => document.body?.innerText || "");
-  // 進入禁止系やエラー系（文字化けでもボタンだけ見える等）を弾く
+
+  // 進入禁止/無効/エラー系のヒントがあれば「失敗として落とす」
+  // （空き0件と誤判定しない）
   const suspicious =
     bodyText.includes("エラー") ||
     bodyText.includes("無効") ||
@@ -50,9 +60,7 @@ async function ensureNotErrorPage(page, label) {
 
   if (suspicious) {
     await safeShot(page, SHOT.error);
-    try {
-      fs.writeFileSync(HTML_ERROR, await page.content(), "utf-8");
-    } catch (_) {}
+    await dumpHtml(page);
     throw new Error(`不正遷移/エラーページ疑い (${label}) url=${page.url()}`);
   }
 }
@@ -64,46 +72,48 @@ async function ensureNotErrorPage(page, label) {
 
     const browser = await puppeteer.launch({
       headless: "new",
-     args: [
-  "--no-sandbox",
-  "--disable-setuid-sandbox",
-  "--lang=ja-JP",
-  "--disable-dev-shm-usage"
-],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--lang=ja-JP",
+        "--disable-dev-shm-usage",
+      ],
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 720 });
     await page.setExtraHTTPHeaders({ "Accept-Language": "ja-JP,ja;q=0.9" });
 
+    // ナビゲーションが遅い環境（GitHub Actions）向けに延長
+    page.setDefaultNavigationTimeout(90000);
+
     console.log("1) トップへアクセス:", START_URL);
-    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1200);
+    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: 90000 });
+    await page.waitForTimeout(1500);
     await safeShot(page, SHOT.start);
     await ensureNotErrorPage(page, "start");
 
-    // ここが肝：トップを踏んだ“同一セッション”のまま、カレンダーURLへ移動
     console.log("2) カレンダーURLへ goto:", CAL_URL);
 
-    // ナビタイムアウトを延長
-    page.setDefaultNavigationTimeout(90000);
-
     const gotoCalendar = async () => {
+      // 1回目：軽い waitUntil でまず到達を優先
       try {
-        // waitUntil を軽くする（WebFormsで重い/長引くのを避ける）
         await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
       } catch (e) {
         console.log("goto 1回目が失敗（タイムアウト含む）:", e && e.message ? e.message : e);
       }
-      // 少し待って状態確認
+
       await page.waitForTimeout(4000);
-      const u = page.url();
+      let u = page.url();
       console.log("goto後URL:", u);
-      // まだ目的URLでなければ1回だけリトライ
+
+      // 目的URLに見えていなければリトライ1回
       if (!u.includes("WgR_ShisetsubetsuAkiJoukyou")) {
         console.log("リトライで再gotoします");
         await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
         await page.waitForTimeout(4000);
+        u = page.url();
+        console.log("リトライ後URL:", u);
       }
     };
 
@@ -115,19 +125,17 @@ async function ensureNotErrorPage(page, label) {
     const urlNow = page.url();
     console.log("到達URL:", urlNow);
 
+    // 到達できていない場合は必ず失敗として落とす（誤判定防止）
     if (!urlNow.includes("WgR_ShisetsubetsuAkiJoukyou")) {
+      await safeShot(page, SHOT.error);
+      await dumpHtml(page);
       throw new Error(`庭球場カレンダー未到達: url=${urlNow}`);
     }
 
-    // 到達判定：URLに期待文字列が含まれない場合は「未到達」として落とす（誤判定防止）
-    if (!urlNow.includes("WgR_ShisetsubetsuAkiJoukyou")) {
-      throw new Error(`庭球場カレンダー未到達: url=${urlNow}`);
-    }
-
-    // ここまで来たら「到達成功」なので、まずは成功通知だけ出す（空き抽出は次段で詰める）
+    // ここまで来たら「到達成功」なのでまずは成功通知だけ
     await sendMail(
       "✅ 目黒区チェッカー：カレンダー到達確認",
-      `カレンダーページへ到達できました。\n\nURL:\n${urlNow}\n\n次はこのページから○/△を抽出して時間帯まで深掘りします。`
+      `カレンダーページへ到達できました。\n\nURL:\n${urlNow}\n\n次はこのページから○/△を抽出して時間帯ページまで追跡します。`
     );
 
     await browser.close();
@@ -137,7 +145,7 @@ async function ensureNotErrorPage(page, label) {
     try {
       await sendMail(
         "❌ 目黒区チェッカー：遷移エラー",
-        `${err && (err.stack || err.message || err)}\n\nスクショはArtifactsを確認してください。`
+        `${err && (err.stack || err.message || err)}\n\nArtifacts に /tmp のスクショ・HTMLがあれば確認してください。`
       );
     } catch (_) {}
     process.exit(1);
