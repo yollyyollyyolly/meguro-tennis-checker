@@ -50,8 +50,7 @@ async function dumpHtml(page) {
 async function ensureNotErrorPage(page, label) {
   const bodyText = await page.evaluate(() => document.body?.innerText || "");
 
-  // 進入禁止/無効/エラー系のヒントがあれば「失敗として落とす」
-  // （空き0件と誤判定しない）
+  // エラー/禁止/無効っぽい兆候があれば「失敗として落とす」（誤って空き0件扱いしない）
   const suspicious =
     bodyText.includes("エラー") ||
     bodyText.includes("無効") ||
@@ -63,6 +62,30 @@ async function ensureNotErrorPage(page, label) {
     await dumpHtml(page);
     throw new Error(`不正遷移/エラーページ疑い (${label}) url=${page.url()}`);
   }
+}
+
+async function gotoWithRetry(page, url, label) {
+  // Puppeteerで安全に使える waitUntil のみ使う
+  // 目黒区側が重いので timeout を長め + 2回までリトライ
+  const TIMEOUT = 90000;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      console.log(`${label} goto 試行${attempt}: ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: TIMEOUT });
+      await page.waitForTimeout(2500);
+      console.log(`${label} goto後URL:`, page.url());
+      return;
+    } catch (e) {
+      console.log(`${label} goto失敗(試行${attempt}):`, e && e.message ? e.message : e);
+      await page.waitForTimeout(3000);
+      // 次のattemptへ
+    }
+  }
+
+  // 2回失敗したら最後に少し待ってから状態確認し、ダメなら落とす
+  await page.waitForTimeout(4000);
+  throw new Error(`${label} goto がタイムアウトしました url=${url} current=${page.url()}`);
 }
 
 (async () => {
@@ -84,40 +107,26 @@ async function ensureNotErrorPage(page, label) {
     await page.setViewport({ width: 1280, height: 720 });
     await page.setExtraHTTPHeaders({ "Accept-Language": "ja-JP,ja;q=0.9" });
 
-    // ナビゲーションが遅い環境（GitHub Actions）向けに延長
+    // 遅い環境向け
     page.setDefaultNavigationTimeout(90000);
 
+    // 速度と安定性のために重いリソースをカット（HTML/JS/XHRは通す）
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const type = req.resourceType();
+      if (type === "image" || type === "media" || type === "font") {
+        return req.abort();
+      }
+      return req.continue();
+    });
+
     console.log("1) トップへアクセス:", START_URL);
-    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: 90000 });
-    await page.waitForTimeout(1500);
+    await gotoWithRetry(page, START_URL, "TOP");
     await safeShot(page, SHOT.start);
     await ensureNotErrorPage(page, "start");
 
     console.log("2) カレンダーURLへ goto:", CAL_URL);
-
-    const gotoCalendar = async () => {
-      // 1回目：軽い waitUntil でまず到達を優先
-      try {
-        await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
-      } catch (e) {
-        console.log("goto 1回目が失敗（タイムアウト含む）:", e && e.message ? e.message : e);
-      }
-
-      await page.waitForTimeout(4000);
-      let u = page.url();
-      console.log("goto後URL:", u);
-
-      // 目的URLに見えていなければリトライ1回
-      if (!u.includes("WgR_ShisetsubetsuAkiJoukyou")) {
-        console.log("リトライで再gotoします");
-        await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
-        await page.waitForTimeout(4000);
-        u = page.url();
-        console.log("リトライ後URL:", u);
-      }
-    };
-
-    await gotoCalendar();
+    await gotoWithRetry(page, CAL_URL, "CAL");
 
     await safeShot(page, SHOT.afterGotoCal);
     await ensureNotErrorPage(page, "after_goto_cal");
@@ -125,14 +134,14 @@ async function ensureNotErrorPage(page, label) {
     const urlNow = page.url();
     console.log("到達URL:", urlNow);
 
-    // 到達できていない場合は必ず失敗として落とす（誤判定防止）
+    // 到達できていない場合は必ず失敗（誤判定防止）
     if (!urlNow.includes("WgR_ShisetsubetsuAkiJoukyou")) {
       await safeShot(page, SHOT.error);
       await dumpHtml(page);
       throw new Error(`庭球場カレンダー未到達: url=${urlNow}`);
     }
 
-    // ここまで来たら「到達成功」なのでまずは成功通知だけ
+    // 到達確認OK → まず成功通知（この後、○/△抽出＋時間帯追跡を実装）
     await sendMail(
       "✅ 目黒区チェッカー：カレンダー到達確認",
       `カレンダーページへ到達できました。\n\nURL:\n${urlNow}\n\n次はこのページから○/△を抽出して時間帯ページまで追跡します。`
