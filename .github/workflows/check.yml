@@ -34,14 +34,14 @@ jobs:
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: npm start
 
-      - name: デバッグ成果物をアップロード
+      - name: スクリーンショットをアップロード
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-${{ github.run_number }}
+          name: screenshot-${{ github.run_number }}
           path: |
-            /tmp/meguro-*.png
-            /tmp/meguro-*.html
-            /tmp/meguro-*.txt
+            /tmp/*.png
+            /tmp/*.html
+            /tmp/*.txt
           if-no-files-found: ignore
           retention-days: 7
