@@ -1,321 +1,441 @@
-const fs = require("fs");
-const puppeteer = require("puppeteer");
-const { Resend } = require("resend");
+// check-availability.js
+// Meguro Tennis Availability Watcher (Windows local / Playwright)
+// - Robust navigation with retries
+// - Avoids waiting for images/fonts (resource filtering)
+// - Captures HTML + screenshot on failures
+// - Sends email via Resend when availability found (or on errors if configured)
 
-// ========= ENV =========
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+const fs = require("fs");
+const path = require("path");
+const { chromium } = require("playwright");
+const { Resend } = require("resend");
 
 const START_URL = "https://resv.city.meguro.tokyo.jp/Web/Home/WgR_ModeSelect";
 const CAL_URL = "https://resv.city.meguro.tokyo.jp/Web/Yoyaku/WgR_ShisetsubetsuAkiJoukyou";
+const DETAIL_URL = "https://resv.city.meguro.tokyo.jp/Web/Yoyaku/WgR_JikantaibetsuAkiJoukyou";
 
-const TS = new Date().toISOString().replace(/[:.]/g, "-");
-const OUT = {
-  startPng: `/tmp/01_start_${TS}.png`,
-  calPng: `/tmp/02_calendar_${TS}.png`,
-  errPng: `/tmp/99_error_${TS}.png`,
-  startHtml: `/tmp/01_start_${TS}.html`,
-  calHtml: `/tmp/02_calendar_${TS}.html`,
-  errHtml: `/tmp/99_error_${TS}.html`,
-  logTxt: `/tmp/00_log_${TS}.txt`,
-};
+const TARGET_FACILITIES = [
+  { key: "駒場", includes: ["駒場"] },
+  { key: "区民センター", includes: ["区民センター"] },
+  { key: "碑文谷", includes: ["碑文谷"] },
+];
 
-// ========= Utils =========
-function must(name, v) {
-  if (!v) throw new Error(`Missing env: ${name}`);
+// ====== ENV ======
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || "";
+// 任意：エラー時にも通知したいなら "1"
+const NOTIFY_ON_ERROR = process.env.NOTIFY_ON_ERROR || "0";
+
+// 任意：混雑回避（少し待つ）
+const EXTRA_DELAY_MS = parseInt(process.env.EXTRA_DELAY_MS || "0", 10);
+
+// ====== UTIL ======
+function ts() {
+  return new Date().toISOString();
 }
-function log(line) {
-  const s = `[${new Date().toISOString()}] ${line}\n`;
-  process.stdout.write(s);
-  try {
-    fs.appendFileSync(OUT.logTxt, s, "utf-8");
-  } catch (_) {}
+function log(msg) {
+  console.log(`[${ts()}] ${msg}`);
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-async function safeWrite(path, content) {
+
+function safeWrite(file, content) {
   try {
-    fs.writeFileSync(path, content, "utf-8");
-  } catch (_) {}
+    fs.writeFileSync(file, content);
+  } catch (e) {
+    // ignore
+  }
 }
-async function safeShot(page, path) {
-  try {
-    await page.screenshot({ path, fullPage: true });
-  } catch (_) {}
-}
-function isGoBackErrorUrl(url) {
-  return typeof url === "string" && url.includes("/Web/Error/html/GoBackError.html");
-}
+
 async function sendMail(subject, text) {
-  must("RESEND_API_KEY", RESEND_API_KEY);
-  must("NOTIFY_EMAIL", NOTIFY_EMAIL);
+  if (!RESEND_API_KEY || !NOTIFY_EMAIL) {
+    log("MAIL: skipped (RESEND_API_KEY or NOTIFY_EMAIL missing)");
+    return;
+  }
   const resend = new Resend(RESEND_API_KEY);
   const { data, error } = await resend.emails.send({
-    from: "Meguro Tennis Checker <onboarding@resend.dev>",
+    from: "tennis-checker <onboarding@resend.dev>",
     to: [NOTIFY_EMAIL],
     subject,
     text,
   });
-  if (error) throw new Error(`Resend error: ${JSON.stringify(error)}`);
-  log(`メール送信成功 ${data ? `id=${data.id}` : ""}`);
-}
-
-// ========= Navigation helpers =========
-async function gotoWithRetry(page, url, label, opts = {}) {
-  const timeouts = [60000, 120000, 180000];
-  const waitUntils = ["domcontentloaded", "networkidle2"];
-
-  for (let i = 0; i < 3; i++) {
-    const backoff = 1500 * Math.pow(2, i);
-    await sleep(backoff);
-    for (const waitUntil of waitUntils) {
-      try {
-        log(`${label}: goto attempt=${i + 1} waitUntil=${waitUntil} url=${url}`);
-        const resp = await page.goto(url, {
-          waitUntil,
-          timeout: timeouts[i],
-          ...opts,
-        });
-        const status = resp ? resp.status() : 0;
-        log(`${label}: goto ok status=${status} final=${page.url()}`);
-        await sleep(1200);
-        return resp;
-      } catch (e) {
-        log(`${label}: goto fail msg=${e?.message || e}`);
-      }
-    }
+  if (error) {
+    log(`MAIL: error ${JSON.stringify(error)}`);
+    return;
   }
-  throw new Error(`${label}: goto failed url=${url} current=${page.url()}`);
+  log(`MAIL: sent id=${data?.id || "unknown"}`);
 }
 
-// 画面上のリンク/ボタンを「狙い撃ち」でクリックする（見つかったら即クリック）
-async function clickByHeuristics(page, label) {
-  log(`${label}: clickByHeuristics start`);
-
-  const result = await page.evaluate((CAL_URL) => {
-    function norm(s) {
-      return (s || "").replace(/\s+/g, " ").trim();
-    }
-    function scoreEl(el) {
-      const tag = el.tagName.toLowerCase();
-      const text = norm(el.innerText || el.textContent || "");
-      const href = el.getAttribute("href") || "";
-      const onclick = el.getAttribute("onclick") || "";
-      const value = el.getAttribute("value") || "";
-
-      let score = 0;
-      if (href.includes("WgR_ShisetsubetsuAkiJoukyou")) score += 100;
-      if (onclick.includes("WgR_ShisetsubetsuAkiJoukyou")) score += 100;
-      if (href === CAL_URL) score += 120;
-
-      const blob = `${text} ${value}`.toLowerCase();
-      if (blob.includes("施設種類")) score += 30;
-      if (blob.includes("庭球場")) score += 25;
-      if (blob.includes("空き") || blob.includes("空状況") || blob.includes("空き状況")) score += 15;
-      if (blob.includes("検索")) score += 10;
-
-      if (tag === "a" || tag === "button") score += 10;
-      if (tag === "input") {
-        const type = (el.getAttribute("type") || "").toLowerCase();
-        if (type === "button" || type === "submit") score += 10;
-      }
-      return { score, tag, text, href, onclick };
-    }
-
-    const candidates = [];
-    const els = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
-    for (const el of els) {
-      const s = scoreEl(el);
-      if (s.score >= 40) candidates.push({ el, ...s });
-    }
-    candidates.sort((a, b) => b.score - a.score);
-
-    if (candidates.length === 0) return { ok: false, why: "no candidates" };
-
-    const best = candidates[0];
-    best.el.scrollIntoView({ block: "center" });
-    best.el.click();
-
-    return {
-      ok: true,
-      picked: { score: best.score, tag: best.tag, text: best.text, href: best.href, onclick: best.onclick },
-      tried: candidates.slice(0, 5).map((c) => ({ score: c.score, tag: c.tag, text: c.text, href: c.href })),
-    };
-  }, CAL_URL);
-
-  log(`${label}: clickByHeuristics result=${JSON.stringify(result)}`);
-  return result && result.ok;
-}
-
-// 「施設種類から探す」→「庭球場」を順にクリックする（最終手段）
-async function clickFacilityFlow(page) {
-  log("FLOW: click facility->tennis (fallback)");
-
-  const clicked1 = await page.evaluate(() => {
-    function norm(s) {
-      return (s || "").replace(/\s+/g, " ").trim();
-    }
-    const els = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
-    const hit = els.find((el) => {
-      const t = norm(el.innerText || el.textContent || el.getAttribute("value") || "");
-      return t.includes("施設種類") || t.includes("種類から探す") || t.includes("施設検索");
-    });
-    if (!hit) return false;
-    hit.scrollIntoView({ block: "center" });
-    hit.click();
-    return true;
-  });
-  log(`FLOW: clicked facility-search=${clicked1}`);
-
-  await sleep(1500);
-
-  const clicked2 = await page.evaluate(() => {
-    function norm(s) {
-      return (s || "").replace(/\s+/g, " ").trim();
-    }
-    const els = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit], div, span"));
-    const hit = els.find((el) => {
-      const t = norm(el.innerText || el.textContent || "");
-      return t.includes("庭球場");
-    });
-    if (!hit) return false;
-    hit.scrollIntoView({ block: "center" });
-    hit.click();
-    return true;
-  });
-  log(`FLOW: clicked tennis=${clicked2}`);
-
-  return clicked1 && clicked2;
-}
-
-async function ensureCalendar(page) {
-  await gotoWithRetry(page, START_URL, "TOP");
-
-  const topHtml = await page.content();
-  await safeWrite(OUT.startHtml, topHtml);
-  await safeShot(page, OUT.startPng);
-
-  for (let i = 0; i < 3; i++) {
-    log(`CAL: try click heuristics round=${i + 1}`);
-
-    const navPromise = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-    await clickByHeuristics(page, "CAL");
-    const nav = await navPromise;
-
-    await sleep(2000);
-
-    const u = page.url();
-    log(`CAL: after click url=${u} nav=${nav ? "yes" : "no"}`);
-    if (u.includes("WgR_ShisetsubetsuAkiJoukyou") && !isGoBackErrorUrl(u)) return true;
-
-    if (isGoBackErrorUrl(u)) {
-      log("CAL: hit GoBackError after click, going back to TOP and retry");
-      await gotoWithRetry(page, START_URL, "TOP_RETRY");
-      continue;
-    }
-  }
-
-  log("CAL: fallback facility flow");
-  await gotoWithRetry(page, START_URL, "TOP_FALLBACK");
-  const navPromise2 = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => null);
-  await clickFacilityFlow(page);
-  await navPromise2;
-  await sleep(2000);
-
-  const u2 = page.url();
-  log(`CAL: after facility flow url=${u2}`);
-  if (u2.includes("WgR_ShisetsubetsuAkiJoukyou") && !isGoBackErrorUrl(u2)) return true;
-
-  log("CAL: last resort goto CAL with referer");
-  await gotoWithRetry(page, CAL_URL, "CAL_GOTO_LAST", { referer: START_URL });
-  await sleep(1200);
-  const u3 = page.url();
-  log(`CAL: after last resort url=${u3}`);
-  if (u3.includes("WgR_ShisetsubetsuAkiJoukyou") && !isGoBackErrorUrl(u3)) return true;
-
-  return false;
-}
-
-// ========= Main =========
-(async () => {
-  let browser;
-  try {
-    must("RESEND_API_KEY", RESEND_API_KEY);
-    must("NOTIFY_EMAIL", NOTIFY_EMAIL);
-
-    log("=== START ===");
-    log(`START_URL: ${START_URL}`);
-    log(`CAL_URL:   ${CAL_URL}`);
-    log(`NOTIFY_EMAIL: ***`);
-
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    });
-
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    );
-
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const t = req.resourceType();
-      if (t === "image" || t === "font" || t === "media") return req.abort();
-      return req.continue();
-    });
-    page.on("requestfailed", (req) => {
-      log(`requestfailed: ${req.resourceType()} ${req.failure()?.errorText} ${req.url()}`);
-    });
-
-    const reached = await ensureCalendar(page);
-
-    const calHtml = await page.content();
-    await safeWrite(OUT.calHtml, calHtml);
-    await safeShot(page, OUT.calPng);
-
-    const finalUrl = page.url();
-    log(`FINAL url=${finalUrl}`);
-
-    if (!reached || isGoBackErrorUrl(finalUrl) || !finalUrl.includes("WgR_ShisetsubetsuAkiJoukyou")) {
-      await safeShot(page, OUT.errPng);
-      await safeWrite(OUT.errHtml, calHtml);
-      throw new Error(`CAL not reached (or GoBackError). final=${finalUrl}`);
-    }
-
-    await sendMail(
-      "✅ 目黒区チェッカー：カレンダー到達（正規遷移OK）",
-      [
-        "カレンダーページに正規遷移で到達できました。",
-        "",
-        `finalUrl: ${finalUrl}`,
-        "",
-        "Artifactsにデバッグ出力があります：",
-        `- ${OUT.startPng}`,
-        `- ${OUT.calPng}`,
-        `- ${OUT.startHtml}`,
-        `- ${OUT.calHtml}`,
-        `- ${OUT.logTxt}`,
-      ].join("\n")
-    );
-
-    log("=== DONE ===");
-    await browser.close();
-  } catch (e) {
-    log(`FATAL: ${e?.stack || e?.message || e}`);
+async function withRetries(name, fn, { tries = 3, baseDelay = 1500 } = {}) {
+  let lastErr = null;
+  for (let i = 1; i <= tries; i++) {
     try {
-      await sendMail(
-        "❌ 目黒区チェッカー：エラー",
-        ["実行中にエラーが発生しました。", "", String(e?.stack || e?.message || e)].join("\n")
-      );
-    } catch (_) {}
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (_) {}
+      return await fn(i);
+    } catch (e) {
+      lastErr = e;
+      log(`${name}: attempt ${i}/${tries} failed: ${e?.message || e}`);
+      const backoff = baseDelay * Math.pow(2, i - 1);
+      await sleep(backoff);
     }
-    process.exit(1);
   }
-})();
+  throw lastErr;
+}
+
+// ====== PARSING ======
+
+// 施設別カレンダー（○/△）を取る：最終的には詳細ページで時間まで取るので、ここは「対象施設が出ていること」の確認用に軽く使う
+function extractFacilityCalendarMarks(html) {
+  // HTML上で「駒場」「区民センター」「碑文谷」と「○」「△」が近接しているかの雑判定
+  // 正確な取得は詳細ページで行う
+  const results = [];
+  for (const f of TARGET_FACILITIES) {
+    const hit = f.includes.some((kw) => html.includes(kw));
+    results.push({ facility: f.key, present: hit });
+  }
+  return results;
+}
+
+// 詳細ページ（時間帯別）から「○」だけ抜く
+// 目黒区サイトはテーブル構造が変動し得るので、DOMを走査して「○」セルの近傍テキストから
+// 日付/面/時間帯を推定する（ロバスト寄り）
+async function extractTimeSlots(page) {
+  // 文字化け対策：ページの textContent を主に使う（画像/フォント不要）
+  const items = await page.evaluate(() => {
+    function clean(s) {
+      return (s || "").replace(/\s+/g, " ").trim();
+    }
+
+    // 日付見出しっぽいもの（例: 1月21日(水)）を拾う
+    const bodyText = document.body ? document.body.innerText : "";
+    const dateRegex = /(\d{1,2})月(\d{1,2})日\s*\((.)\)/g;
+
+    // DOMベースでテーブルを探す
+    const tables = Array.from(document.querySelectorAll("table"));
+    const results = [];
+
+    // 日付ブロックを推定：テーブル前後の見出し
+    function findNearestDate(el) {
+      let cur = el;
+      for (let i = 0; i < 8 && cur; i++) {
+        // 兄弟/親を遡って innerText から日付を探す
+        const t = clean(cur.innerText);
+        const m = t.match(/(\d{1,2})月(\d{1,2})日\s*\((.)\)/);
+        if (m) return m[0];
+        cur = cur.parentElement;
+      }
+      // 全文から最初の方の一致（弱い）
+      const m2 = bodyText.match(/(\d{1,2})月(\d{1,2})日\s*\((.)\)/);
+      return m2 ? m2[0] : "";
+    }
+
+    // 面（A面/B面等）推定
+    function inferCourtFromRow(row) {
+      const th = row.querySelector("th");
+      if (th) {
+        const t = clean(th.innerText);
+        if (t) return t;
+      }
+      // 先頭セル
+      const first = row.querySelector("td");
+      if (first) {
+        const t = clean(first.innerText);
+        // "A面"などが含まれる場合
+        if (t.includes("面")) return t;
+      }
+      return "";
+    }
+
+    // 時間帯推定：ヘッダ行に時間があることが多い
+    function inferTimeHeaders(table) {
+      const headerCells = Array.from(table.querySelectorAll("tr")).slice(0, 2)
+        .flatMap(tr => Array.from(tr.querySelectorAll("th,td")));
+      const texts = headerCells.map(c => clean(c.innerText));
+      // "9:00" などを含むものだけ
+      const timeLike = texts.filter(t => /\d{1,2}:\d{2}/.test(t));
+      // 重複除去
+      return Array.from(new Set(timeLike));
+    }
+
+    for (const table of tables) {
+      const timeHeaders = inferTimeHeaders(table);
+      const rows = Array.from(table.querySelectorAll("tr"));
+
+      // "○"セルを探す
+      for (const row of rows) {
+        const cells = Array.from(row.querySelectorAll("td"));
+        if (!cells.length) continue;
+
+        const court = inferCourtFromRow(row);
+
+        for (let idx = 0; idx < cells.length; idx++) {
+          const c = cells[idx];
+          const t = clean(c.innerText);
+
+          if (t === "○" || t === "◯") {
+            const date = findNearestDate(table) || findNearestDate(row) || "";
+            const time = timeHeaders[idx] || ""; // 位置が合う場合
+            results.push({
+              date,
+              court,
+              time,
+              raw: t
+            });
+          }
+        }
+      }
+    }
+
+    // さらに、テーブルが取れなかった場合の保険：本文から "○" の近傍だけ拾う（粗い）
+    if (results.length === 0) {
+      // ここでは何もしない（誤検出が増えるため）
+    }
+
+    return results;
+  });
+
+  // 正規化：施設名が詳細ページに出ている前提で、施設名は外で付与
+  return items
+    .map((x) => ({
+      date: (x.date || "").trim(),
+      court: (x.court || "").trim(),
+      time: (x.time || "").trim(),
+    }))
+    .filter((x) => x.date || x.court || x.time);
+}
+
+// ====== MAIN ======
+
+async function main() {
+  log("=== START ===");
+  log(`START_URL: ${START_URL}`);
+  log(`CAL_URL:   ${CAL_URL}`);
+  log(`DETAIL_URL:${DETAIL_URL}`);
+  log(`NOTIFY_EMAIL: ${NOTIFY_EMAIL ? "***" : "(missing)"}`);
+
+  const artifactsDir = path.join(process.cwd(), "artifacts");
+  if (!fs.existsSync(artifactsDir)) fs.mkdirSync(artifactsDir, { recursive: true });
+
+  const browser = await chromium.launch({
+    headless: true,
+  });
+
+  const context = await browser.newContext({
+    locale: "ja-JP",
+    timezoneId: "Asia/Tokyo",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    ignoreHTTPSErrors: true,
+  });
+
+  const page = await context.newPage();
+
+  // 重いリソースをブロック（文字化け対策ではなく「安定性＆速度」目的）
+ _vlan:
+  page.route("**/*", async (route) => {
+    const req = route.request();
+    const url = req.url();
+    const type = req.resourceType();
+    if (
+      type === "image" ||
+      type === "media" ||
+      type === "font" ||
+      url.endsWith(".png") ||
+      url.endsWith(".jpg") ||
+      url.endsWith(".jpeg") ||
+      url.endsWith(".gif") ||
+      url.endsWith(".woff") ||
+      url.endsWith(".woff2") ||
+      url.endsWith(".ttf")
+    ) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
+  page.on("requestfailed", (req) => {
+    const url = req.url();
+    const failure = req.failure();
+    if (failure && /ERR_FAILED|TIMED_OUT/i.test(failure.errorText || "")) {
+      // ノイズになりやすいので抑制気味に
+      // log(`requestfailed: ${req.resourceType()} ${failure.errorText} ${url}`);
+      return;
+    }
+  });
+
+  // 重要：タイムアウトを長めに
+  page.setDefaultTimeout(120000);
+  page.setDefaultNavigationTimeout(120000);
+
+  async function snap(label) {
+    const png = path.join(artifactsDir, `${label}.png`);
+    const html = path.join(artifactsDir, `${label}.html`);
+    try {
+      await page.screenshot({ path: png, fullPage: true });
+    } catch {}
+    try {
+      const content = await page.content();
+      safeWrite(html, content);
+    } catch {}
+    return { png, html };
+  }
+
+  try {
+    // 1) トップへアクセス（セッション確立）
+    await withRetries(
+      "TOP",
+      async (i) => {
+        log(`TOP: goto attempt=${i} url=${START_URL}`);
+        await page.goto(START_URL, { waitUntil: "domcontentloaded" });
+        // ちょい待つ（JS初期化）
+        await page.waitForTimeout(1500);
+      },
+      { tries: 3, baseDelay: 1500 }
+    );
+
+    if (EXTRA_DELAY_MS > 0) {
+      await sleep(EXTRA_DELAY_MS);
+    }
+
+    // 2) カレンダーページへ（直接 goto ）
+    await withRetries(
+      "CAL",
+      async (i) => {
+        log(`CAL: goto attempt=${i} url=${CAL_URL}`);
+        await page.goto(CAL_URL, { waitUntil: "domcontentloaded" });
+        // GoBackError.html へ飛ばされる場合があるので検知
+        const cur = page.url();
+        if (cur.includes("/Web/Error/html/GoBackError.html")) {
+          throw new Error("CAL: redirected to GoBackError.html");
+        }
+        // JSで中身が描画されることがあるので少し待つ
+        await page.waitForTimeout(2000);
+      },
+      { tries: 5, baseDelay: 2000 }
+    );
+
+    await snap("01_calendar");
+
+    // 3) 対象施設が表示されているか軽く確認（存在しないと以降の詳細も意味薄い）
+    const calHtml = await page.content();
+    const presences = extractFacilityCalendarMarks(calHtml);
+    log(`CAL: presence=${JSON.stringify(presences)}`);
+
+    // 4) 詳細ページへ
+    // ここが「直アクセスで弾かれる」場合があるため、2段階でトライ：
+    //   a) そのまま goto DETAIL_URL
+    //   b) CALページ上からリンク/フォームがあればクリック（heuristics）
+    async function gotoDetailDirect() {
+      await page.goto(DETAIL_URL, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2500);
+      const cur = page.url();
+      if (cur.includes("/Web/Error/html/GoBackError.html")) {
+        throw new Error("DETAIL: redirected to GoBackError.html");
+      }
+    }
+
+    async function gotoDetailByHeuristics() {
+      // CALページに戻って、"時間帯別" 的なリンクを探してクリック
+      await page.goto(CAL_URL, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2000);
+
+      const clicked = await page.evaluate(() => {
+        function norm(s) {
+          return (s || "").replace(/\s+/g, " ").trim();
+        }
+        const candidates = [];
+        const texts = [
+          "時間帯別",
+          "時間帯",
+          "空き状況",
+          "時間帯別空き状況",
+          "時間帯別の空き状況",
+        ];
+        const els = Array.from(document.querySelectorAll("a,button,input[type=submit],input[type=button]"));
+        for (const el of els) {
+          const t = norm(el.innerText || el.value || "");
+          const href = el.getAttribute("href") || "";
+          const onclick = el.getAttribute("onclick") || "";
+          let score = 0;
+          for (const k of texts) {
+            if (t.includes(k)) score += 10;
+          }
+          if (href.includes("WgR_JikantaibetsuAkiJoukyou")) score += 50;
+          if (onclick.includes("Jikantaibetsu")) score += 30;
+          if (score > 0) candidates.push({ score, t, href, onclick });
+        }
+        candidates.sort((a,b)=>b.score-a.score);
+        const top = candidates[0];
+        if (!top) return { ok:false, reason:"no-candidate", candidates:[] };
+
+        // 実クリック
+        // hrefがjavascript:void(0)でも onclick がある場合がある
+        const target = els.find(el => {
+          const tt = norm(el.innerText || el.value || "");
+          const hh = el.getAttribute("href") || "";
+          return tt === top.t && hh === top.href;
+        }) || els.find(el => norm(el.innerText || el.value || "") === top.t);
+
+        if (!target) return { ok:false, reason:"target-not-found", candidates:[top] };
+
+        (target).click();
+        return { ok:true, picked:top };
+      });
+
+      log(`DETAIL: heuristic click result=${JSON.stringify(clicked)}`);
+      // 遷移待ち（SPAの可能性もあるので url 変化 or network idle を緩く）
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+      } catch {}
+      await page.waitForTimeout(2500);
+
+      const cur = page.url();
+      if (cur.includes("/Web/Error/html/GoBackError.html")) {
+        throw new Error("DETAIL(heuristic): redirected to GoBackError.html");
+      }
+      // もしまだCALにいるなら失敗扱い
+      if (cur.includes("WgR_ShisetsubetsuAkiJoukyou")) {
+        throw new Error("DETAIL(heuristic): still on calendar url");
+      }
+    }
+
+    await withRetries(
+      "DETAIL",
+      async (i) => {
+        log(`DETAIL: attempt=${i} direct goto`);
+        try {
+          await gotoDetailDirect();
+          return;
+        } catch (e) {
+          log(`DETAIL: direct failed: ${e.message}`);
+        }
+        log(`DETAIL: attempt=${i} fallback heuristics`);
+        await gotoDetailByHeuristics();
+      },
+      { tries: 4, baseDelay: 2500 }
+    );
+
+    await snap("02_detail");
+
+    // 5) ここで時間帯を抽出
+    const detailUrl = page.url();
+    log(`DETAIL: reached url=${detailUrl}`);
+
+    const allSlots = await extractTimeSlots(page);
+
+    // 6) 施設別に振り分け（詳細ページに施設見出しがある前提で、その近傍で分類…が理想だがまずは最低限）
+    // 最低限：対象施設名がページテキストにあるかでフィルタし、全スロットを各施設に紐づけるのは危険なので
+    //   -> 今回は「ページ全文に施設名が出る」場合だけ、その施設として採用
+    const bodyText = await page.evaluate(() => (document.body ? document.body.innerText : ""));
+    const facilityHits = TARGET_FACILITIES.filter(f => f.includes.some(k => bodyText.includes(k)));
+
+    let findings = [];
+    if (facilityHits.length === 0) {
+      // 施設名が取れない場合：スロットだけ送る（ただし誤通知防止のため subject を弱める）
+      findings = allSlots.map(s => ({ facility: "（施設名未判定）", ...s }));
+    } else if (facilityHits.length === 1) {
+      // 1施設だけ出るならその施設として扱う
+      findings = allSlots.map(s => ({ facility: facilityHits[0].key, ...s }));
+    } else {
+      // 複数施設が同一ページに並ぶ場合：分類が必要だが構造依存が強い
+      // ここでは「一旦まとめて通知（施設未分類）」にして誤分類を避ける
