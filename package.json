@@ -1,14 +1,12 @@
 {
-  "name": "meguro-tennis-checker",
+  "name": "meguro-tennis-bot",
   "version": "1.0.0",
-  "description": "目黒区庭球場の空き状況を自動チェックしてメールで通知",
-  "main": "check-availability.js",
+  "private": true,
   "scripts": {
-    "start": "node check-availability.js"
+    "start": "node watcher.js"
   },
-  "license": "MIT",
   "dependencies": {
-    "puppeteer": "^21.6.1",
+    "playwright": "^1.41.0",
     "resend": "^3.0.0"
   }
 }
