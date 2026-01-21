@@ -83,13 +83,40 @@ async function ensureNotErrorPage(page, label) {
 
     // ここが肝：トップを踏んだ“同一セッション”のまま、カレンダーURLへ移動
     console.log("2) カレンダーURLへ goto:", CAL_URL);
-    await page.goto(CAL_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500);
+
+    // ナビタイムアウトを延長
+    page.setDefaultNavigationTimeout(90000);
+
+    const gotoCalendar = async () => {
+      try {
+        // waitUntil を軽くする（WebFormsで重い/長引くのを避ける）
+        await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
+      } catch (e) {
+        console.log("goto 1回目が失敗（タイムアウト含む）:", e && e.message ? e.message : e);
+      }
+      // 少し待って状態確認
+      await page.waitForTimeout(4000);
+      const u = page.url();
+      console.log("goto後URL:", u);
+      // まだ目的URLでなければ1回だけリトライ
+      if (!u.includes("WgR_ShisetsubetsuAkiJoukyou")) {
+        console.log("リトライで再gotoします");
+        await page.goto(CAL_URL, { waitUntil: "commit", timeout: 90000 });
+        await page.waitForTimeout(4000);
+      }
+    };
+
+    await gotoCalendar();
+
     await safeShot(page, SHOT.afterGotoCal);
     await ensureNotErrorPage(page, "after_goto_cal");
 
     const urlNow = page.url();
     console.log("到達URL:", urlNow);
+
+    if (!urlNow.includes("WgR_ShisetsubetsuAkiJoukyou")) {
+      throw new Error(`庭球場カレンダー未到達: url=${urlNow}`);
+    }
 
     // 到達判定：URLに期待文字列が含まれない場合は「未到達」として落とす（誤判定防止）
     if (!urlNow.includes("WgR_ShisetsubetsuAkiJoukyou")) {
