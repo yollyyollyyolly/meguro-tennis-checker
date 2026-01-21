@@ -241,3 +241,141 @@ async function scanFacility(page, facility) {
         }
 
         // もし表抽出が0なら、ページテキストに○があるかだけでも返す（デバッグ用）
+        return { title, out, hasCircle: availableMarks.some(m => pageText.includes(m)) };
+      }, SYMBOLS.available);
+
+      if (slots.out.length) {
+        results.push(...slots.out.map(line => ({
+          facility: facility.key,
+          line,
+        })));
+      }
+
+      // 戻る（詳細→カレンダー）
+      await page.goBack({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(async () => {
+        // goBack失敗時の保険：カレンダーに戻す
+        await gotoAndWait(page, TARGET_CAL_URL);
+      });
+      await page.waitForTimeout(800);
+      await ensureNotErrorPage(page, `${facility.key} back to calendar`);
+      await safeShot(page, SHOT.calendar);
+
+    } catch (e) {
+      console.log(`詳細取得失敗(${facility.key}):`, e.message || e);
+      // 失敗してもカレンダーに戻して継続
+      await safeShot(page, SHOT.error);
+      await gotoAndWait(page, TARGET_CAL_URL);
+      await page.waitForTimeout(800);
+    }
+  }
+
+  return results;
+}
+
+(async () => {
+  try {
+    mustEnv("RESEND_API_KEY", RESEND_API_KEY);
+    mustEnv("NOTIFY_EMAIL", NOTIFY_EMAIL);
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      locale: "ja-JP",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    });
+    const page = await context.newPage();
+
+    console.log("開始：トップページへ");
+    await gotoAndWait(page, START_URL);
+    await safeShot(page, SHOT.mode);
+    await ensureNotErrorPage(page, "mode_select");
+
+    // ここからは「クリック遷移」固定
+    // 施設種類から探す → 庭球場 → カレンダー
+    console.log("「施設種類から探す」をクリック");
+    await clickByText(page, "施設種類から探す");
+    await page.waitForTimeout(1200);
+    await safeShot(page, SHOT.afterModeClick);
+    await ensureNotErrorPage(page, "after_mode_click");
+
+    console.log("「庭球場」をクリック");
+    await clickByText(page, "庭球場");
+    await page.waitForTimeout(1500);
+    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
+    await ensureNotErrorPage(page, "after_tennis_click");
+
+    // カレンダーに到達しているか（到達してなければ明示的にここで止める）
+    // ※直gotoはしない（最後の保険としてのみ使用）
+    if (!page.url().includes("WgR_ShisetsubetsuAkiJoukyou")) {
+      console.log("注意：カレンダーURLに未到達。現在URL:", page.url());
+      // 念のため一回だけカレンダーURLへ（ここでエラーページになるなら、クリック遷移が壊れている）
+      await gotoAndWait(page, TARGET_CAL_URL);
+      await ensureNotErrorPage(page, "calendar_direct_fallback");
+    }
+
+    console.log("カレンダーページ読み込み完了");
+    await safeShot(page, SHOT.calendar);
+
+    // 施設ごとにクリックして詳細抽出
+    const all = [];
+    for (const f of TARGET_FACILITIES) {
+      console.log(`施設スキャン開始: ${f.key}`);
+      const r = await scanFacility(page, f);
+      all.push(...r);
+    }
+
+    // 重複排除
+    const uniq = [];
+    const seen = new Set();
+    for (const x of all) {
+      const k = `${x.facility}::${x.line}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      uniq.push(x);
+    }
+
+    console.log(`取得した情報: ${uniq.length}件`);
+
+    if (uniq.length === 0) {
+      console.log("現在、対象施設に空きはありません（または抽出できませんでした）");
+      // 通知を出さない（ノイズ削減）
+      // ただし「抽出できていない」可能性をゼロにできないので、最初の数回は通知してもいい
+      // 今回は運用重視で通知なしにする
+    } else {
+      // メール本文整形
+      const lines = [];
+      lines.push("🎾 目黒区庭球場に空きが見つかりました！");
+      lines.push("");
+      for (const f of TARGET_FACILITIES) {
+        const hits = uniq.filter(u => u.facility === f.key);
+        if (!hits.length) continue;
+        lines.push(`【${f.key}】`);
+        for (const h of hits.slice(0, 30)) {
+          lines.push(`- ${h.line}`);
+        }
+        lines.push("");
+      }
+      lines.push("予約・確認はこちら:");
+      lines.push(TARGET_CAL_URL);
+
+      await sendMail("🎾 庭球場に空きあり！", lines.join("\n"));
+    }
+
+    await browser.close();
+    console.log("チェック完了");
+  } catch (err) {
+    console.log("致命的エラー:", err && (err.stack || err.message || err));
+
+    // エラー時は通知を飛ばす（運用上ここが重要）
+    try {
+      await sendMail(
+        "❌ 庭球場チェッカー エラー",
+        `エラーが発生しました。\n\n${err && (err.stack || err.message || err)}\n`
+      );
+    } catch (e2) {
+      console.log("エラーメール送信にも失敗:", e2 && (e2.stack || e2.message || e2));
+    }
+
+    process.exit(1);
+  }
+})();
